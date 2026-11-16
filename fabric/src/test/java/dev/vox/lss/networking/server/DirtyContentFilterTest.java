@@ -350,6 +350,35 @@ class DirtyContentFilterTest {
         assertEquals(1, serializations.get());
     }
 
+    /** A generation-serve seed with the chunk in hand stores the served-bytes hash AND the
+     *  fingerprint: an equal-fingerprint first save serializes nothing; a moved fingerprint
+     *  falls back to the real bytes (equal bytes still suppressed, new bytes mark). */
+    @Test
+    void fingerprintedGenSeedSkipsTheFirstSaveSerialization() {
+        var serializations = new java.util.concurrent.atomic.AtomicInteger();
+        var bytes = new java.util.concurrent.atomic.AtomicReference<byte[]>(new byte[]{1, 2, 3});
+        long[] fp = {9L};
+        var filter = new DirtyContentFilter((level, chunk, cx, cz) -> {
+            serializations.incrementAndGet();
+            return bytes.get();
+        }, (level, chunk, cx, cz) -> fp[0]);
+        var dim = "minecraft:overworld";
+        filter.seed(null, null, dim, 5, 6, new byte[]{1, 2, 3});
+        assertFalse(filter.observeSave(null, null, 5, 6, dim).changed(), "unchanged first save suppressed");
+        assertEquals(0, serializations.get(), "equal fingerprint: no serialization");
+        fp[0] = 10L; // light/palette re-layout, same served bytes
+        assertFalse(filter.observeSave(null, null, 5, 6, dim).changed(), "bytes decide when fp moved");
+        assertEquals(1, serializations.get());
+        bytes.set(new byte[]{4});
+        fp[0] = 11L;
+        assertTrue(filter.observeSave(null, null, 5, 6, dim).changed(), "real edit marks");
+
+        fp[0] = 0L; // fingerprint unavailable: byte-only seed, the save serializes
+        filter.seed(null, null, dim, 7, 8, new byte[]{4});
+        assertFalse(filter.observeSave(null, null, 7, 8, dim).changed());
+        assertEquals(3, serializations.get());
+    }
+
     /** A throwing fingerprinter degrades to the serializing path, never to a suppression. */
     @Test
     void throwingFingerprinterSerializes() {

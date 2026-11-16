@@ -167,6 +167,25 @@ public class DirtyContentFilter {
     }
 
     /**
+     * {@link #seed} with the chunk the bytes were just serialized from, so the baseline
+     * also carries its content fingerprint: the chunk's unload-save then matches on the
+     * fingerprint alone and skips the mask + serialization entirely. Must run while the
+     * chunk still holds the content {@code serializedSections} came from (same tick).
+     * The fingerprint is taken outside the monitor; 0 (unavailable) degrades to the
+     * byte-only seed.
+     */
+    public void seed(ServerLevel level, LevelChunk chunk, String dimension, int cx, int cz,
+                     byte[] serializedSections) {
+        long fingerprint = fingerprintOf(level, chunk, cx, cz);
+        long hash = hashContent(serializedSections);
+        long packed = PositionUtil.packPosition(cx, cz);
+        synchronized (this) {
+            storeHash(dimension, packed, hash);
+            storeFingerprint(dimension, packed, fingerprint);
+        }
+    }
+
+    /**
      * Record a just-LOADED chunk's content as its change baseline (WI-1b Option L): the
      * chunk-load seam fires at FULL status with the light engine's data already attached,
      * so the hash equals what the chunk's first save will hash unless content or light

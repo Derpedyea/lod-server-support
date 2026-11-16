@@ -211,8 +211,8 @@ public class ChunkGenerationService {
                     // unload-save would otherwise count as "first observed save" and
                     // trigger a pointless second send of the identical column.
                     if (this.dirtyContentFilter != null) {
-                        this.dirtyContentFilter.seed(dimension, gen.pos.x(), gen.pos.z(),
-                                columnData.serializedSections());
+                        this.dirtyContentFilter.seed(gen.level, chunk, dimension,
+                                gen.pos.x(), gen.pos.z(), columnData.serializedSections());
                     }
 
                     // One GenerationReadyData per callback — processing thread will voxelize
