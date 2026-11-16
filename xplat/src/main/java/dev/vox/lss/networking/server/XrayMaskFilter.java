@@ -187,10 +187,168 @@ public final class XrayMaskFilter {
                 masked, dev.vox.lss.platform.SectionConstruction.biomes(section));
     }
 
-    /** One pass, one allocation: reads the source container, writes same-or-replacement
-     *  into a fresh replacement-seeded container whose palette ends minimal — never the
-     *  source's entry-0 seed that {@code recreate()} would smuggle in. */
+    /**
+     * The fast twin of {@link #maskedStatesReference}, byte-identical by construction: the
+     * source's palette indices are unpacked once, the replacement comes from an
+     * {@code int[palette]} histogram (same per-entry counts + lowest-id tie-break as
+     * {@code count()}), hidden-ness is decided once per palette entry, and the fresh
+     * container sees the SAME {@code idFor} sequence as the reference (cells in index
+     * order, replacement cells skipped) via {@code getAndSetUnchecked} — the fresh
+     * container is thread-confined, so the ThreadingDetector lock per cell buys nothing.
+     */
     private static PalettedContainer<BlockState> maskedStates(PalettedContainer<BlockState> states,
+                                                              int sectionY, MaskSet mask, FallbackKind kind,
+                                                              PalettedContainerFactory factory,
+                                                              int[] replacedCellsOut) {
+        Plan plan = Plan.of(states, sectionY, mask);
+        if (plan == null) {
+            return maskedStatesReference(states, sectionY, mask, kind, factory, replacedCellsOut);
+        }
+        return plan.build(kind, factory, replacedCellsOut);
+    }
+
+    /**
+     * Live serve path: masks {@code section} and writes its wire bytes ({@code
+     * LevelChunkSection.write}'s layout: nonEmpty short, fluid short, states, biomes)
+     * straight into {@code buf}, skipping the masked section object and its per-cell
+     * {@code recalcBlockCounts} — the count headers come from the plan's histogram with
+     * BlockCounter's rule. Returns the replaced-cell count, or -1 when the section needs
+     * no masking (nothing written; the caller writes the section itself).
+     */
+    public static int maskAndWrite(LevelChunkSection section, int sectionY, MaskSet mask, FallbackKind kind,
+                                   PalettedContainerFactory factory, net.minecraft.network.FriendlyByteBuf buf) {
+        if (!needsMasking(section, sectionY, mask)) return -1;
+        int[] replaced = new int[1];
+        Plan plan = Plan.of(section.getStates(), sectionY, mask);
+        if (plan == null) {
+            var masked = dev.vox.lss.platform.SectionConstruction.withStates(
+                    maskedStatesReference(section.getStates(), sectionY, mask, kind, factory, replaced),
+                    dev.vox.lss.platform.SectionConstruction.biomes(section));
+            masked.write(buf);
+            return replaced[0];
+        }
+        PalettedContainer<BlockState> fresh = plan.build(kind, factory, replaced);
+        int counts = plan.outputCounts();
+        buf.writeShort(counts >>> 16);
+        buf.writeShort(counts & 0xFFFF);
+        fresh.write(buf);
+        dev.vox.lss.platform.SectionConstruction.biomes(section).write(buf);
+        return replaced[0];
+    }
+
+    /** One section's unpacked source: palette states, per-cell indices, histograms. */
+    private static final class Plan {
+        private static final ThreadLocal<int[]> CELLS = ThreadLocal.withInitial(() -> new int[4096]);
+
+        final int[] cells;
+        final BlockState[] stateOf;
+        final boolean[] hidden;
+        final int[] hist;
+        final int[] histBelow;
+        final int limit;
+        final int sectionY;
+        final MaskSet mask;
+        BlockState replacement;
+
+        private Plan(int[] cells, BlockState[] stateOf, boolean[] hidden, int[] hist, int[] histBelow,
+                     int limit, int sectionY, MaskSet mask) {
+            this.cells = cells; this.stateOf = stateOf; this.hidden = hidden; this.hist = hist;
+            this.histBelow = histBelow; this.limit = limit; this.sectionY = sectionY; this.mask = mask;
+        }
+
+        /** Null when the container is not a plain 4096-cell section with a bounded palette. */
+        static Plan of(PalettedContainer<BlockState> states, int sectionY, MaskSet mask) {
+            var data = states.data; // access-widened (see lss.accesswidener)
+            var palette = data.palette();
+            var storage = data.storage();
+            int n = palette.getSize();
+            if (n <= 0 || n > 4096 || storage.getSize() != 4096) return null;
+            int[] cells = CELLS.get();
+            storage.unpack(cells);
+            int yLimit = Math.min(16, mask.maxBlockHeight - (sectionY << 4));
+            int limit = Math.max(0, yLimit) << 8;
+            int[] hist = new int[n];
+            int[] histBelow = new int[n];
+            for (int i = 0; i < limit; i++) histBelow[cells[i]]++;
+            for (int i = 0; i < 4096; i++) hist[cells[i]]++;
+            var stateOf = new BlockState[n];
+            var hidden = new boolean[n];
+            for (int p = 0; p < n; p++) {
+                if (hist[p] == 0) continue;
+                BlockState s = palette.valueFor(p);
+                stateOf[p] = s;
+                hidden[p] = mask.contains(s);
+            }
+            return new Plan(cells, stateOf, hidden, hist, histBelow, limit, sectionY, mask);
+        }
+
+        PalettedContainer<BlockState> build(FallbackKind kind, PalettedContainerFactory factory, int[] replacedOut) {
+            this.replacement = chooseReplacement();
+            if (this.replacement == null) this.replacement = fallbackReplacement(this.sectionY, kind);
+            BlockState rep = this.replacement;
+            PalettedContainer<BlockState> fresh = new PalettedContainer<>(rep, factory.blockStatesStrategy());
+            int[] cells = this.cells;
+            int replaced = 0;
+            for (int i = 0; i < 4096; i++) {
+                int p = cells[i];
+                if (i < this.limit && this.hidden[p]) {
+                    replaced++;
+                    continue;
+                }
+                BlockState s = this.stateOf[p];
+                if (s != rep) fresh.getAndSetUnchecked(i & 15, i >>> 8, (i >>> 4) & 15, s);
+            }
+            replacedOut[0] = replaced;
+            return fresh;
+        }
+
+        /** chooseReplacement's rule over the histogram: dominant non-air, non-hidden entry. */
+        private BlockState chooseReplacement() {
+            BlockState best = null;
+            int bestCount = 0, bestId = 0;
+            for (int p = 0; p < this.hist.length; p++) {
+                int c = this.hist[p];
+                if (c == 0) continue;
+                BlockState s = this.stateOf[p];
+                if (s.isAir() || this.hidden[p]) continue;
+                int id = Block.BLOCK_STATE_REGISTRY.getId(s);
+                if (best == null || c > bestCount || (c == bestCount && id < bestId)) {
+                    best = s; bestCount = c; bestId = id;
+                }
+            }
+            return best;
+        }
+
+        /** Masked output's {@code (nonEmpty << 16) | fluid}, BlockCounter's rule. */
+        int outputCounts() {
+            int[] acc = new int[2];
+            for (int p = 0; p < this.hist.length; p++) {
+                int c = this.hist[p];
+                if (c == 0) continue;
+                if (this.hidden[p]) {
+                    int below = this.histBelow[p];
+                    add(acc, this.replacement, below);
+                    add(acc, this.stateOf[p], c - below);
+                } else {
+                    add(acc, this.stateOf[p], c);
+                }
+            }
+            return (acc[0] << 16) | acc[1];
+        }
+
+        private static void add(int[] acc, BlockState s, int c) {
+            if (c == 0 || s.isAir()) return;
+            acc[0] += c;
+            if (!s.getFluidState().isEmpty()) acc[1] += c;
+        }
+    }
+
+    /** Per-cell reference rebuild: reads the source container, writes same-or-replacement
+     *  into a fresh replacement-seeded container whose palette ends minimal — never the
+     *  source's entry-0 seed that {@code recreate()} would smuggle in. The fast path
+     *  ({@link #maskedStates}) must stay byte-identical to this; it is also the fallback for
+     *  global-palette containers. */
+    static PalettedContainer<BlockState> maskedStatesReference(PalettedContainer<BlockState> states,
                                                               int sectionY, MaskSet mask, FallbackKind kind,
                                                               PalettedContainerFactory factory,
                                                               int[] replacedCellsOut) {
@@ -264,6 +422,10 @@ public final class XrayMaskFilter {
             }
         });
         if (best.state != null) return best.state;
+        return fallbackReplacement(sectionY, kind);
+    }
+
+    private static BlockState fallbackReplacement(int sectionY, FallbackKind kind) {
         return switch (kind) {
             case NETHER -> Blocks.NETHERRACK.defaultBlockState();
             case END -> Blocks.END_STONE.defaultBlockState();

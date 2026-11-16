@@ -111,25 +111,21 @@ public final class SectionSerializer {
 
             for (var info : includedSections) {
                 var section = sections[info.index];
-                if (maskEntry != null) {
-                    // Masking INSIDE the choke point: probe, generation, and the
-                    // DirtyContentFilter hash all see identical masked bytes by construction.
-                    int[] replacedCells = new int[1];
-                    var masked = XrayMaskFilter.mask(section, info.sectionY,
-                            maskEntry.mask(), maskEntry.kind(), maskFactory, replacedCells);
-                    if (masked != section) {
-                        section = masked;
-                        // Count only when cells were actually hidden — a stale-palette
-                        // rebuild (mined-out ore still listed) swaps for the prune only.
-                        if (replacedCells[0] > 0) {
-                            var manager = XrayMaskManager.current();
-                            if (manager != null) manager.countMaskedSection();
-                        }
-                    }
-                }
-
                 buf.writeByte(info.sectionY);
-                section.write(buf);
+                // Masking INSIDE the choke point: probe, generation, and the
+                // DirtyContentFilter hash all see identical masked bytes by construction.
+                // maskAndWrite emits the masked section's exact wire bytes without building
+                // the section object (no per-cell recalcBlockCounts); -1 = nothing to mask.
+                int replacedCells = maskEntry == null ? -1 : XrayMaskFilter.maskAndWrite(section, info.sectionY,
+                        maskEntry.mask(), maskEntry.kind(), maskFactory, buf);
+                if (replacedCells < 0) {
+                    section.write(buf);
+                } else if (replacedCells > 0) {
+                    // Count only when cells were actually hidden — a stale-palette
+                    // rebuild (mined-out ore still listed) swaps for the prune only.
+                    var manager = XrayMaskManager.current();
+                    if (manager != null) manager.countMaskedSection();
+                }
 
                 // Block light (cached from pass 1)
                 buf.writeBoolean(info.hasBlockLight);

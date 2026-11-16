@@ -104,6 +104,66 @@ class XrayMaskFilterTest {
                 "a moved cutoff must fingerprint apart");
     }
 
+    @Test
+    void fastMaskIsByteIdenticalToTheReferenceRebuild() {
+        var rnd = new java.util.Random(0x5EEDL);
+        var pool = new java.util.ArrayList<BlockState>(List.of(Blocks.STONE.defaultBlockState(),
+                Blocks.DEEPSLATE.defaultBlockState(), Blocks.AIR.defaultBlockState(),
+                Blocks.WATER.defaultBlockState(), Blocks.LAVA.defaultBlockState(),
+                Blocks.DIAMOND_ORE.defaultBlockState(), Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(),
+                Blocks.GOLD_ORE.defaultBlockState(), Blocks.IRON_ORE.defaultBlockState()));
+        for (int id = 1; pool.size() < 400; id += 37) pool.add(Block.BLOCK_STATE_REGISTRY.byId(id));
+        int[] paletteSizes = {1, 2, 3, 5, 9, 17, 40, 120, 257, 400};
+        int[] heights = {-64, 0, 7, 16, 23, 64};
+        int masked = 0;
+        for (int round = 0; round < 600; round++) {
+            var s = newSection();
+            int k = paletteSizes[round % paletteSizes.length];
+            var states = new java.util.ArrayList<BlockState>(pool.subList(0, Math.min(k, pool.size())));
+            java.util.Collections.shuffle(states, rnd);
+            if (!states.contains(Blocks.DIAMOND_ORE.defaultBlockState()) && rnd.nextBoolean()) {
+                states.set(0, Blocks.DIAMOND_ORE.defaultBlockState());
+            }
+            BlockState cur = states.get(0);
+            for (int i = 0; i < 4096; i++) {
+                if (rnd.nextInt(6) == 0) cur = states.get(rnd.nextInt(states.size()));
+                s.setBlockState(i & 15, i >>> 8, (i >>> 4) & 15, cur);
+            }
+            if (round % 7 == 0) { // stale palette entry: an ore placed and mined out
+                s.setBlockState(3, 3, 3, Blocks.GOLD_ORE.defaultBlockState());
+                s.setBlockState(3, 3, 3, Blocks.STONE.defaultBlockState());
+            }
+            int sectionY = rnd.nextInt(9) - 4;
+            var m = XrayMaskFilter.MaskSet.resolve(ServerConfigBase.defaultXrayHiddenBlocks(),
+                    heights[rnd.nextInt(heights.length)]);
+            var kind = FallbackKind.values()[rnd.nextInt(FallbackKind.values().length)];
+            String ctx = "round " + round + " k=" + k + " sy=" + sectionY + " h=" + m.maxBlockHeight();
+
+            int[] fastReplaced = new int[1];
+            var fast = XrayMaskFilter.mask(s, sectionY, m, kind, FACTORY, fastReplaced);
+            var buf = new FriendlyByteBuf(Unpooled.buffer());
+            int written = XrayMaskFilter.maskAndWrite(s, sectionY, m, kind, FACTORY, buf);
+            byte[] direct = new byte[buf.readableBytes()];
+            buf.readBytes(direct);
+            buf.release();
+            if (fast == s) {
+                assertEquals(-1, written, ctx);
+                assertEquals(0, direct.length, ctx);
+                continue;
+            }
+            masked++;
+            int[] refReplaced = new int[1];
+            var ref = new LevelChunkSection(XrayMaskFilter.maskedStatesReference(s.getStates(), sectionY, m, kind,
+                    FACTORY, refReplaced), s.getBiomes());
+            byte[] refBytes = sectionBytes(ref);
+            assertArrayEquals(refBytes, sectionBytes(fast), "fast mask vs reference, " + ctx);
+            assertArrayEquals(refBytes, direct, "maskAndWrite vs reference, " + ctx);
+            assertEquals(refReplaced[0], fastReplaced[0], ctx);
+            assertEquals(refReplaced[0], written, ctx);
+        }
+        assertTrue(masked > 200, "too few masked rounds: " + masked);
+    }
+
     // ---- helpers ----
 
     /** A mask from the production default list with a cutoff high enough to be inert. */
