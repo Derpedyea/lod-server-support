@@ -544,12 +544,15 @@ tasks.register('vssJar') {
                         // the dedicated VSS icon is RESTORED (branding/vss/icon.png, injected
                         // below as assets/lss/icon-vss.png).
                         def json = new groovy.json.JsonSlurper().parse(zf.getInputStream(e))
-                        json.name = 'Voxy Server Side'
-                        json.description = 'Render distant Voxy LODs on servers'
+                        // Winter fork: say so, credit upstream, point at the fork (not upstream's
+                        // Modrinth page), so this build never passes as an official release.
+                        json.name = 'Voxy Server Side (Winter fork)'
+                        json.description = 'Unofficial performance fork of Voxy Server Side / LOD Server Support for the Winter modpack; not supported by upstream. Render distant Voxy LODs on servers.'
                         json.authors = ['Xantha', 'VoX']
+                        json.contributors = ['Derpedyea (fork)']
                         json.icon = 'assets/lss/icon-vss.png'
                         if (json.contact instanceof Map) {
-                            json.contact.homepage = 'https://modrinth.com/plugin/voxy-server-side'
+                            json.contact.homepage = 'https://github.com/Derpedyea/lod-server-support'
                         }
                         byte[] bytes = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)).getBytes('UTF-8')
                         def ne = new ZipEntry('fabric.mod.json')
