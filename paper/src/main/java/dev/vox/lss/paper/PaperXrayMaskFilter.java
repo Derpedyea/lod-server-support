@@ -197,13 +197,24 @@ final class PaperXrayMaskFilter {
         // already reveal them, masking would only mismatch near terrain.
         int yLimit = Math.min(16, mask.maxBlockHeight - bottomY);
         int replaced = 0;
+        // Same loop as XrayMaskFilter's: contains() cached on the last state, and cells
+        // whose output is the seed replacement are left as seeded (identical bytes).
+        BlockState last = null;
+        boolean lastHidden = false;
         for (int y = 0; y < 16; y++) {
+            boolean below = y < yLimit;
             for (int z = 0; z < 16; z++) {
                 for (int x = 0; x < 16; x++) {
                     BlockState state = states.get(x, y, z);
-                    boolean hide = y < yLimit && mask.contains(state);
-                    if (hide) replaced++;
-                    fresh.set(x, y, z, hide ? replacement : state);
+                    if (state != last) {
+                        last = state;
+                        lastHidden = mask.contains(state);
+                    }
+                    if (below && lastHidden) {
+                        replaced++;
+                    } else if (state != replacement) {
+                        fresh.set(x, y, z, state);
+                    }
                 }
             }
         }

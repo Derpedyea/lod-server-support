@@ -287,4 +287,80 @@ class DirtyContentFilterTest {
         assertTrue(filter.storeHash(dim, pos, 1L), "edit back to zero-hashing content marks");
         assertFalse(filter.storeHash(dim, pos, 1L), "filtering resumes on the remapped value");
     }
+
+    // ---- Content fingerprint fast path ----
+
+    /** An equal fingerprint skips serialization entirely; a moved fingerprint serializes
+     *  and falls back to the served-bytes comparison (so a palette re-layout with the same
+     *  served bytes is still suppressed); eviction/forget/seed drop the fingerprint. */
+    @Test
+    void equalFingerprintSkipsSerializationAndMovedOneFallsBackToBytes() {
+        var serializations = new java.util.concurrent.atomic.AtomicInteger();
+        var bytes = new java.util.concurrent.atomic.AtomicReference<byte[]>(new byte[]{1, 2, 3});
+        long[] fp = {42L};
+        var filter = new DirtyContentFilter((level, chunk, cx, cz) -> {
+            serializations.incrementAndGet();
+            return bytes.get();
+        }, (level, chunk, cx, cz) -> fp[0]);
+        var dim = "minecraft:overworld";
+        assertTrue(filter.observeSave(null, null, 1, 2, dim).changed(), "first observation marks");
+        assertEquals(1, serializations.get());
+        assertFalse(filter.observeSave(null, null, 1, 2, dim).changed());
+        assertFalse(filter.contentChanged(null, null, 1, 2, dim));
+        assertEquals(1, serializations.get(), "equal fingerprint: no serialization");
+        assertEquals(2L, filter.getTotalSuppressed());
+
+        fp[0] = 43L; // re-layout, same served bytes
+        assertFalse(filter.observeSave(null, null, 1, 2, dim).changed(), "bytes decide when fp moved");
+        assertEquals(2, serializations.get());
+        bytes.set(new byte[]{7});
+        fp[0] = 44L;
+        var obs = filter.observeSave(null, null, 1, 2, dim);
+        assertTrue(obs.changed());
+        assertArrayEquals(new byte[]{7}, obs.sectionBytes());
+
+        // A generation-serve seed knows bytes only: the next save must serialize.
+        filter.seed(dim, 1, 2, new byte[]{7});
+        assertFalse(filter.observeSave(null, null, 1, 2, dim).changed());
+        assertEquals(4, serializations.get(), "seed() clears the fingerprint");
+        filter.forget(dim, 1, 2);
+        assertTrue(filter.observeSave(null, null, 1, 2, dim).changed(), "forget drops both");
+    }
+
+    /** A fingerprinted load seed serializes nothing; its first save is suppressed on an
+     *  equal fingerprint and marks (fail-open) on a moved one, even with equal bytes. */
+    @Test
+    void fingerprintedLoadSeedSkipsSerialization() {
+        var serializations = new java.util.concurrent.atomic.AtomicInteger();
+        long[] fp = {7L};
+        var filter = new DirtyContentFilter((level, chunk, cx, cz) -> {
+            serializations.incrementAndGet();
+            return new byte[]{1, 2, 3};
+        }, (level, chunk, cx, cz) -> fp[0]);
+        var dim = "minecraft:overworld";
+        filter.seedLoaded(null, null, 3, 4, dim);
+        assertEquals(0, serializations.get(), "load seed records only the fingerprint");
+        assertEquals(1L, filter.getTotalSeededLoads());
+        assertEquals(1, filter.entryCount());
+        assertFalse(filter.contentChanged(null, null, 3, 4, dim), "unchanged first save suppressed");
+        assertEquals(0, serializations.get());
+        fp[0] = 8L;
+        assertTrue(filter.contentChanged(null, null, 3, 4, dim), "moved fingerprint fails open");
+        assertFalse(filter.contentChanged(null, null, 3, 4, dim), "then the real hash is the baseline");
+        assertEquals(1, serializations.get());
+    }
+
+    /** A throwing fingerprinter degrades to the serializing path, never to a suppression. */
+    @Test
+    void throwingFingerprinterSerializes() {
+        var filter = new DirtyContentFilter((level, chunk, cx, cz) -> new byte[]{5},
+                (level, chunk, cx, cz) -> { throw new IllegalStateException("boom"); });
+        assertTrue(filter.observeSave(null, null, 0, 0, "minecraft:overworld").changed());
+        assertFalse(filter.observeSave(null, null, 0, 0, "minecraft:overworld").changed());
+    }
+
+    @Test
+    void fingerprintOnlySentinelIsRemapped() {
+        assertEquals(3L, DirtyContentFilter.remapAbsentSentinel(DirtyContentFilter.FINGERPRINT_ONLY));
+    }
 }

@@ -40,9 +40,12 @@ public final class SectionSerializer {
         return AntiXrayCompat.callSerializing(() -> serializeColumnInner(level, chunk, cx, cz));
     }
 
-    private static LoadedColumnData serializeColumnInner(ServerLevel level, LevelChunk chunk, int cx, int cz) {
+    /** Pass 1 + the band rule: the sections a column serves, with their light layers
+     *  cached. Shared by the serializer and {@link #fingerprintColumn}, so the two can
+     *  never disagree about what is served. */
+    private static java.util.List<SectionInfo> includedSections(ServerLevel level, LevelChunkSection[] sections,
+                                                                int cx, int cz) {
         int minSectionY = level.getMinSectionY();
-        var sections = chunk.getSections();
         var lightEngine = level.getLightEngine();
         var blockLightListener = lightEngine.getLayerListener(LightLayer.BLOCK);
         var skyLightListener = lightEngine.getLayerListener(LightLayer.SKY);
@@ -88,6 +91,12 @@ public final class SectionSerializer {
         includedSections.removeIf(info -> sections[info.index()].hasOnlyAir()
                 && !info.hasBlockLight()
                 && (noContent || info.sectionY() < lo || info.sectionY() > hi));
+        return includedSections;
+    }
+
+    private static LoadedColumnData serializeColumnInner(ServerLevel level, LevelChunk chunk, int cx, int cz) {
+        var sections = chunk.getSections();
+        var includedSections = includedSections(level, sections, cx, cz);
 
         if (includedSections.isEmpty()) {
             return new LoadedColumnData(cx, cz, null, 0);
@@ -146,6 +155,53 @@ public final class SectionSerializer {
         } finally {
             buf.release();
         }
+    }
+
+    /** Reusable per-thread scratch for {@link #fingerprintColumn}: a heap buffer, so its
+     *  backing array can be hashed directly. */
+    private static final ThreadLocal<FriendlyByteBuf> FINGERPRINT_BUF =
+            ThreadLocal.withInitial(() -> new FriendlyByteBuf(Unpooled.buffer(16 * 1024)));
+
+    /**
+     * A cheap fingerprint of every input {@link #serializeColumn} reads: the served section
+     * set, each section's UNMASKED native bytes ({@code section.write}: counts, palettes,
+     * bit storage, biomes), its light flags and bytes, and the active x-ray mask's
+     * semantics. Masking, the v20 translation and the registry are deterministic given
+     * those, so equal fingerprints mean equal served bytes; the converse does not hold
+     * (a palette re-layout without a content change gives a new fingerprint), which only
+     * costs a real serialization. Skips the mask rebuild and the v20 translation, the two
+     * costly steps. Never returns 0 (0 = "no fingerprint" to callers).
+     */
+    public static long fingerprintColumn(ServerLevel level, LevelChunk chunk, int cx, int cz) {
+        return AntiXrayCompat.callSerializing(() -> fingerprintColumnInner(level, chunk, cx, cz));
+    }
+
+    private static long fingerprintColumnInner(ServerLevel level, LevelChunk chunk, int cx, int cz) {
+        var sections = chunk.getSections();
+        var included = includedSections(level, sections, cx, cz);
+        var h = new ContentHasher();
+        h.add(included.size());
+        var maskEntry = XrayMaskManager.entryForActive(level);
+        if (maskEntry == null) {
+            h.add(0L);
+        } else {
+            h.add(maskEntry.mask().isEmpty() ? 1L : maskEntry.mask().fingerprint());
+            h.add(maskEntry.mask().maxBlockHeight());
+            h.add(maskEntry.kind().ordinal());
+        }
+        var buf = FINGERPRINT_BUF.get();
+        for (var info : included) {
+            h.add(info.sectionY);
+            buf.clear();
+            sections[info.index].write(buf);
+            h.add(buf.array(), buf.arrayOffset(), buf.writerIndex());
+            h.add(info.hasBlockLight ? 1L : 0L);
+            if (info.hasBlockLight) h.add(info.blLayer.getData());
+            h.add(info.hasSkyLight ? 1L : 0L);
+            if (info.hasSkyLight) h.add(info.slLayer.getData());
+        }
+        if (buf.capacity() > 256 * 1024) FINGERPRINT_BUF.remove(); // don't pin an outlier
+        return h.finish();
     }
 
     private static boolean hasNonZeroData(DataLayer layer) {

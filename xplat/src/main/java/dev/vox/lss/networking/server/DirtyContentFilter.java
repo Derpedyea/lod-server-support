@@ -3,6 +3,7 @@ package dev.vox.lss.networking.server;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import it.unimi.dsi.fastutil.longs.Long2LongLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.LevelChunk;
 
@@ -66,8 +67,17 @@ public class DirtyContentFilter {
      *  so air-to-air saves stay quiet and air-to-built transitions mark dirty. */
     private static final long ALL_AIR_HASH = 0x9E3779B97F4A7C15L;
 
+    /** Stored in place of a served-bytes hash when only the content FINGERPRINT of the
+     *  baseline is known (a chunk-load seed): equal-fingerprint saves are suppressed, any
+     *  other save reads as changed (fail-open). Real hashes are remapped off it. */
+    static final long FINGERPRINT_ONLY = 2L;
+
     private final Map<String, Long2LongLinkedOpenHashMap> hashesByDimension = new HashMap<>();
+    /** Pre-serialization fingerprint of the content that produced each stored hash (absent
+     *  = unknown, e.g. a generation-serve seed). Always a subset of hashesByDimension's keys. */
+    private final Map<String, Long2LongOpenHashMap> fingerprintsByDimension = new HashMap<>();
     private final ColumnSerializer serializer;
+    private final ColumnFingerprinter fingerprinter;
 
     // Saves whose LOD-visible content matched the stored hash — the metadata-only re-saves this
     // filter exists to suppress (vanilla's ~10s inhabitedTime re-saves). Closes the dirty
@@ -86,13 +96,62 @@ public class DirtyContentFilter {
         byte[] serializeSections(ServerLevel level, LevelChunk chunk, int cx, int cz);
     }
 
-    public DirtyContentFilter() {
-        this((level, chunk, cx, cz) -> SectionSerializer.serializeColumn(level, chunk, cx, cz).serializedSections());
+    /** A cheap fingerprint of exactly the inputs the serializer reads ({@link
+     *  SectionSerializer#fingerprintColumn}): equal fingerprints guarantee equal served
+     *  bytes. 0 = unavailable (the filter then serializes, as before). */
+    @FunctionalInterface
+    interface ColumnFingerprinter {
+        long fingerprint(ServerLevel level, LevelChunk chunk, int cx, int cz);
     }
 
-    /** Test seam (see {@link ColumnSerializer}); zero behavior change when default-wired. */
+    public DirtyContentFilter() {
+        this((level, chunk, cx, cz) -> SectionSerializer.serializeColumn(level, chunk, cx, cz).serializedSections(),
+                SectionSerializer::fingerprintColumn);
+    }
+
+    /** Test seam (see {@link ColumnSerializer}): no fingerprints, every observation serializes. */
     DirtyContentFilter(ColumnSerializer serializer) {
+        this(serializer, (level, chunk, cx, cz) -> 0L);
+    }
+
+    /** Test seam with an injected fingerprinter. */
+    DirtyContentFilter(ColumnSerializer serializer, ColumnFingerprinter fingerprinter) {
         this.serializer = serializer;
+        this.fingerprinter = fingerprinter;
+    }
+
+    /** Fingerprint, or 0 when unavailable or failing (the caller then serializes). */
+    private long fingerprintOf(ServerLevel level, LevelChunk chunk, int cx, int cz) {
+        try {
+            return this.fingerprinter.fingerprint(level, chunk, cx, cz);
+        } catch (Exception e) {
+            LSSLogger.debug("Dirty-content fingerprint failed for chunk " + cx + "," + cz + ": " + e);
+            return 0L;
+        }
+    }
+
+    /** True when the stored baseline for {@code packed} was built from content with this
+     *  exact fingerprint: the served bytes are then identical, nothing to serialize. Touches
+     *  the LRU entry like a stored hash would. Caller holds the monitor. */
+    private boolean matchesBaseline(String dimension, long packed, long fingerprint) {
+        if (fingerprint == 0L) return false;
+        var fps = this.fingerprintsByDimension.get(dimension);
+        if (fps == null || fps.get(packed) != fingerprint) return false;
+        var hashes = this.hashesByDimension.get(dimension);
+        if (hashes == null || !hashes.containsKey(packed)) return false;
+        hashes.getAndMoveToLast(packed);
+        return true;
+    }
+
+    /** Records (or clears, for 0) the fingerprint behind the hash just stored. */
+    private void storeFingerprint(String dimension, long packed, long fingerprint) {
+        if (fingerprint == 0L) {
+            var fps = this.fingerprintsByDimension.get(dimension);
+            if (fps != null) fps.remove(packed);
+            return;
+        }
+        this.fingerprintsByDimension.computeIfAbsent(dimension, k -> new Long2LongOpenHashMap())
+                .put(packed, fingerprint);
     }
 
     /**
@@ -102,7 +161,9 @@ public class DirtyContentFilter {
      * which otherwise re-sends every generated column a second time for nothing.
      */
     public synchronized void seed(String dimension, int cx, int cz, byte[] serializedSections) {
-        storeHash(dimension, PositionUtil.packPosition(cx, cz), hashContent(serializedSections));
+        long packed = PositionUtil.packPosition(cx, cz);
+        storeHash(dimension, packed, hashContent(serializedSections));
+        storeFingerprint(dimension, packed, 0L); // bytes known, content fingerprint not
     }
 
     /**
@@ -127,6 +188,23 @@ public class DirtyContentFilter {
      *  held by an off-main C2ME/Moonrise save worker mid-serialize — the monitor
      *  protects the hash STATE, which only {@link #storeHash} touches. */
     void seedLoaded(ServerLevel level, LevelChunk chunk, int cx, int cz, String dimension) {
+        long packed = PositionUtil.packPosition(cx, cz);
+        // Fast path: record only the content fingerprint (no mask rebuild, no v20
+        // translation). An equal-fingerprint first save is suppressed exactly as a matching
+        // hash would be; a save whose fingerprint moved serializes and reads as changed
+        // against FINGERPRINT_ONLY even when its served bytes happen to match (a palette
+        // re-layout with no content change within the ~10 s before the first save): fail-open.
+        long fingerprint = fingerprintOf(level, chunk, cx, cz);
+        if (fingerprint != 0L) {
+            synchronized (this) {
+                if (!matchesBaseline(dimension, packed, fingerprint)) {
+                    storeHash(dimension, packed, FINGERPRINT_ONLY);
+                    storeFingerprint(dimension, packed, fingerprint);
+                }
+                this.totalSeededLoads++;
+            }
+            return;
+        }
         long hash;
         try {
             hash = hashContent(this.serializer.serializeSections(level, chunk, cx, cz));
@@ -135,7 +213,8 @@ public class DirtyContentFilter {
             return;
         }
         synchronized (this) {
-            storeHash(dimension, PositionUtil.packPosition(cx, cz), hash);
+            storeHash(dimension, packed, hash);
+            storeFingerprint(dimension, packed, 0L);
             this.totalSeededLoads++;
         }
     }
@@ -172,6 +251,12 @@ public class DirtyContentFilter {
     /** Position-explicit body (test seam, like contentChanged's). */
     synchronized SaveObservation observeSave(ServerLevel level, LevelChunk chunk,
                                              int cx, int cz, String dimension) {
+        long packed = PositionUtil.packPosition(cx, cz);
+        long fingerprint = fingerprintOf(level, chunk, cx, cz);
+        if (matchesBaseline(dimension, packed, fingerprint)) {
+            this.totalSuppressed++;
+            return SaveObservation.UNCHANGED;
+        }
         byte[] sections;
         long hash;
         try {
@@ -181,8 +266,8 @@ public class DirtyContentFilter {
             LSSLogger.debug("Dirty-content hash failed for chunk " + cx + "," + cz + ": " + e);
             return SaveObservation.FAIL_OPEN;
         }
-        long packed = PositionUtil.packPosition(cx, cz);
         boolean changed = storeHash(dimension, packed, hash);
+        storeFingerprint(dimension, packed, fingerprint);
         if (!changed) {
             this.totalSuppressed++;
             return SaveObservation.UNCHANGED;
@@ -199,6 +284,12 @@ public class DirtyContentFilter {
      *  without constructing MC level/chunk objects. Synchronized (reentrant from the public
      *  overload) so the seam keeps the class's entry-points-hold-the-lock insurance. */
     synchronized boolean contentChanged(ServerLevel level, LevelChunk chunk, int cx, int cz, String dimension) {
+        long packed = PositionUtil.packPosition(cx, cz);
+        long fingerprint = fingerprintOf(level, chunk, cx, cz);
+        if (matchesBaseline(dimension, packed, fingerprint)) {
+            this.totalSuppressed++;
+            return false;
+        }
         long hash;
         int lastLen;
         try {
@@ -210,8 +301,8 @@ public class DirtyContentFilter {
             return true;
         }
 
-        long packed = PositionUtil.packPosition(cx, cz);
         boolean changed = storeHash(dimension, packed, hash);
+        storeFingerprint(dimension, packed, fingerprint);
         if (!changed) this.totalSuppressed++; // metadata-only re-save the filter suppressed
         if (changed && Boolean.getBoolean("lss.soak.dirtydebug")) {
             LSSLogger.info("[DirtyDebug] re-marked " + cx + "," + cz
@@ -233,7 +324,10 @@ public class DirtyContentFilter {
         // touched) goes. A plain put would keep INSERTION order and evict the hottest
         // (oldest-inserted, most re-saved) chunks first (panel fold, Opus A M4).
         if (hashes.size() >= MAX_ENTRIES_PER_DIMENSION && !hashes.containsKey(packed)) {
+            long evicted = hashes.firstLongKey();
             hashes.removeFirstLong();
+            var fps = this.fingerprintsByDimension.get(dimension);
+            if (fps != null) fps.remove(evicted);
         }
         long previous = hashes.putAndMoveToLast(packed, hash);
         return previous != hash;
@@ -247,8 +341,11 @@ public class DirtyContentFilter {
     /** Forget a baseline (the 2.x lifecycle module's {@code CHUNK_GENERATE} twin of the
      *  newly-generated skip): the chunk's next save reads absent → changed, as before. */
     public synchronized void forget(String dimension, int cx, int cz) {
+        long packed = PositionUtil.packPosition(cx, cz);
         var hashes = this.hashesByDimension.get(dimension);
-        if (hashes != null) hashes.remove(PositionUtil.packPosition(cx, cz));
+        if (hashes != null) hashes.remove(packed);
+        var fps = this.fingerprintsByDimension.get(dimension);
+        if (fps != null) fps.remove(packed);
     }
 
     /** Cumulative count of chunk-load baselines (see {@link #totalSeededLoads}). */
@@ -281,6 +378,6 @@ public class DirtyContentFilter {
      *  (a stored 0 would make the first observation read as unchanged). Package-visible:
      *  no constructible input has a raw FNV-1a of 0, so the remap is only pinnable in isolation. */
     static long remapAbsentSentinel(long h) {
-        return h == 0L ? 1L : h;
+        return h == 0L ? 1L : h == FINGERPRINT_ONLY ? 3L : h;
     }
 }

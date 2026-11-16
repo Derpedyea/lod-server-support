@@ -47,7 +47,11 @@ tasks.register('generateSqliteRuntime') {
             }
         }
         def digest = hash(capsule.bytes)
-        if (digest != pins.capsuleSha256) throw new GradleException("SQLite capsule digest mismatch: ${digest}")
+        if (digest != pins.capsuleSha256) {
+            // zlib-ng distros (CachyOS, Fedora 40+) deflate differently: same entries, other bytes
+            if (project.findProperty('lss.capsuleDigestWarnOnly') == 'true') logger.warn("SQLite capsule digest mismatch (allowed): ${digest}")
+            else throw new GradleException("SQLite capsule digest mismatch: ${digest}")
+        }
         def bridgeName = 'dev/vox/lss/jdbc/PrivateSqliteBridge.class'
         def bridge = sourceSets.sqliteBridge.output.classesDirs.files.collect { new File(it, bridgeName) }.find { it.isFile() }
         new File(out, 'bridge.class.bin').bytes = bridge.bytes
