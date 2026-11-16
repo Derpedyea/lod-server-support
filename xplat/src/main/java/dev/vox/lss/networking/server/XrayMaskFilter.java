@@ -227,11 +227,15 @@ public final class XrayMaskFilter {
             masked.write(buf);
             return replaced[0];
         }
-        PalettedContainer<BlockState> fresh = plan.build(kind, factory, replaced);
+        int start = buf.writerIndex();
+        buf.writeInt(0); // count shorts, patched once the replacement is known
+        if (!plan.writeStates(kind, buf, replaced)) {
+            buf.writerIndex(start + 4);
+            plan.build(kind, factory, replaced).write(buf);
+        }
         int counts = plan.outputCounts();
-        buf.writeShort(counts >>> 16);
-        buf.writeShort(counts & 0xFFFF);
-        fresh.write(buf);
+        buf.setShort(start, counts >>> 16);
+        buf.setShort(start + 2, counts & 0xFFFF);
         dev.vox.lss.platform.SectionConstruction.biomes(section).write(buf);
         return replaced[0];
     }
@@ -300,6 +304,92 @@ public final class XrayMaskFilter {
             }
             replacedOut[0] = replaced;
             return fresh;
+        }
+
+        private static final ThreadLocal<int[]> OUT = ThreadLocal.withInitial(() -> new int[4096]);
+
+        /**
+         * Writes the masked states container ({@code PalettedContainer.write}'s layout) straight
+         * from the unpacked cells, byte-identical to {@code build(...).write(buf)}: it replays
+         * vanilla's palette growth for a replacement-seeded container fed the same cell order —
+         * Single, then a 4-bit linear palette ({@code [rep, first-seen...]}), then 5..8-bit
+         * hashmaps, each resize re-ordering ids by first encounter over all 4096 cells
+         * ({@code Data.copyFrom}; unset cells still hold rep) and appending the new state.
+         * Returns false (nothing written) past 8 bits, where the global palette takes over.
+         */
+        boolean writeStates(FallbackKind kind, net.minecraft.network.FriendlyByteBuf buf, int[] replacedOut) {
+            this.replacement = chooseReplacement();
+            if (this.replacement == null) this.replacement = fallbackReplacement(this.sectionY, kind);
+            BlockState rep = this.replacement;
+            int[] cells = this.cells;
+            int[] out = OUT.get();
+            int n = this.hist.length;
+            int[] map = new int[n];
+            java.util.Arrays.fill(map, -1);
+            BlockState[] pal = new BlockState[256];
+            pal[0] = rep;
+            int size = 1, bits = 0, repId = 0, replaced = 0;
+            for (int i = 0; i < 4096; i++) {
+                int p = cells[i];
+                if (i < this.limit && this.hidden[p]) {
+                    replaced++;
+                    out[i] = repId;
+                    continue;
+                }
+                int id = map[p];
+                if (id < 0) {
+                    BlockState s = this.stateOf[p];
+                    id = -1;
+                    for (int j = 0; j < size; j++) if (pal[j] == s) { id = j; break; }
+                    if (id < 0) {
+                        int cap = bits == 0 ? 1 : 1 << bits;
+                        if (size == cap) {
+                            if (bits == 8) return false;
+                            if (bits == 0) {
+                                bits = 4; // Single -> FOUR_BITS_LINEAR: copyFrom fills rep as id 0
+                            } else {
+                                // copyFrom re-ids by first encounter over all cells; cells >= i hold rep
+                                bits++;
+                                int[] perm = new int[size];
+                                java.util.Arrays.fill(perm, -1);
+                                BlockState[] np = new BlockState[256];
+                                int ns = 0;
+                                for (int c = 0; c < i && ns < size; c++) {
+                                    int o = out[c];
+                                    if (perm[o] < 0) { perm[o] = ns; np[ns++] = pal[o]; }
+                                }
+                                if (perm[repId] < 0) { perm[repId] = ns; np[ns++] = pal[repId]; }
+                                for (int c = 0; c < i; c++) out[c] = perm[out[c]];
+                                for (int q = 0; q < n; q++) if (map[q] >= 0) map[q] = perm[map[q]];
+                                repId = perm[repId];
+                                pal = np;
+                                size = ns;
+                            }
+                        }
+                        id = size;
+                        pal[size++] = s;
+                    }
+                    map[p] = id;
+                }
+                out[i] = id;
+            }
+            replacedOut[0] = replaced;
+            var registry = Block.BLOCK_STATE_REGISTRY;
+            buf.writeByte(bits);
+            if (bits == 0) {
+                buf.writeVarInt(registry.getId(rep));
+                return true;
+            }
+            buf.writeVarInt(size);
+            for (int j = 0; j < size; j++) buf.writeVarInt(registry.getId(pal[j]));
+            int perLong = 64 / bits;
+            for (int base = 0; base < 4096; base += perLong) {
+                long v = 0L;
+                int end = Math.min(base + perLong, 4096);
+                for (int c = end - 1; c >= base; c--) v = (v << bits) | out[c];
+                buf.writeLong(v);
+            }
+            return true;
         }
 
         /** chooseReplacement's rule over the histogram: dominant non-air, non-hidden entry. */
