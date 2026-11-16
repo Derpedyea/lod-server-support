@@ -1,5 +1,7 @@
 # LOD Server Support
 
+> **Winter fork.** Unofficial performance fork of [VoX/lod-server-support](https://github.com/VoX/lod-server-support) (MIT) for the Winter modpack (Fabric 26.3). Not supported by upstream; report issues here, not there.
+
 Enables players with [Voxy](https://modrinth.com/mod/voxy) to see fully rendered terrain out to hundreds of chunks on multiplayer servers without needing to explore the world first. Also includes **Far Players**: players far beyond normal render distance appear in the LOD terrain with name tags, equipment, and mounts.
 
 **Try it live**: join `lod-server-support.modrinth.gg` with Voxy and this mod installed. Supports Minecraft 26.3, 26.2, 26.1, 1.21.11, 1.21.10, and 1.21.1.

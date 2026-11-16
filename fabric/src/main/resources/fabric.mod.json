@@ -1,14 +1,17 @@
 {
   "schemaVersion": 1,
   "id": "lss",
-  "version": "${version}",
-  "name": "LOD Server Support",
-  "description": "Voxy multiplayer support (unofficial). Enables players with Voxy to see fully rendered terrain out to hundreds of chunks on multiplayer servers without needing to explore the world first.",
+  "version": "${version}+winter.1",
+  "name": "LOD Server Support (Winter fork)",
+  "description": "Unofficial performance fork of VoX's LOD Server Support for the Winter modpack; not supported by upstream. Voxy multiplayer support. Enables players with Voxy to see fully rendered terrain out to hundreds of chunks on multiplayer servers without needing to explore the world first.",
   "authors": [
     "VoX"
   ],
+  "contributors": [
+    "Derpedyea (fork)"
+  ],
   "contact": {
-    "sources": "https://github.com/VoX/lod-server-support"
+    "sources": "https://github.com/Derpedyea/lod-server-support"
   },
   "license": "MIT",
   "icon": "assets/lss/icon.png",
